@@ -2,6 +2,7 @@ defmodule LiveDraftLsp.SocketClient do
   @moduledoc """
   WebSocket client that speaks Phoenix Channel protocol.
   Maintains a persistent connection and sends draft updates over the channel.
+  Connects lazily on first use and handles disconnects gracefully.
   """
   use WebSockex
   require Logger
@@ -11,17 +12,32 @@ defmodule LiveDraftLsp.SocketClient do
   def start_link(url, token) do
     ws_url = build_ws_url(url, token)
     state = %__MODULE__{token: token, slug: nil, ref: 0, joined: false}
-    WebSockex.start_link(ws_url, __MODULE__, state, name: __MODULE__)
+    WebSockex.start_link(ws_url, __MODULE__, state, name: __MODULE__, handle_initial_conn_failure: true)
   end
 
-  @doc "Join a channel for the given slug"
+  @doc "Ensure the client is started, then join a channel for the given slug"
   def join(slug) do
-    WebSockex.cast(__MODULE__, {:join, slug})
+    if alive?() do
+      WebSockex.cast(__MODULE__, {:join, slug})
+    else
+      Logger.warning("[SocketClient] Not connected, can't join #{slug}")
+    end
   end
 
   @doc "Send draft content over the channel"
   def push_draft(content) do
-    WebSockex.cast(__MODULE__, {:push_draft, content})
+    if alive?() do
+      WebSockex.cast(__MODULE__, {:push_draft, content})
+    else
+      Logger.warning("[SocketClient] Not connected, dropping draft")
+    end
+  end
+
+  defp alive? do
+    case Process.whereis(__MODULE__) do
+      nil -> false
+      pid -> Process.alive?(pid)
+    end
   end
 
   # --- Callbacks ---
@@ -36,8 +52,8 @@ defmodule LiveDraftLsp.SocketClient do
   def handle_frame({:text, msg}, state) do
     case Jason.decode(msg) do
       {:ok, %{"event" => "phx_reply", "payload" => %{"status" => "ok"}, "ref" => ref}} ->
-        if ref == state.ref - 1 do
-          Logger.debug("[SocketClient] Joined channel successfully")
+        if ref == state.ref do
+          Logger.info("[SocketClient] Joined channel successfully")
           {:ok, %{state | joined: true}}
         else
           {:ok, state}
@@ -94,7 +110,8 @@ defmodule LiveDraftLsp.SocketClient do
 
   @impl true
   def handle_disconnect(%{reason: reason}, state) do
-    Logger.warning("[SocketClient] Disconnected: #{inspect(reason)}, reconnecting...")
+    Logger.warning("[SocketClient] Disconnected: #{inspect(reason)}, reconnecting in 3s...")
+    :timer.sleep(3000)
     {:reconnect, %{state | joined: false}}
   end
 

@@ -54,10 +54,14 @@ defmodule LiveDraftLsp.Server do
   @impl true
   def handle_notification(%Initialized{}, lsp) do
     # Connect to Phoenix once the LSP is initialized
-    {:ok, _pid} =
-      LiveDraftLsp.SocketClient.start_link(lsp.assigns.url, lsp.assigns.token)
+    case LiveDraftLsp.SocketClient.start_link(lsp.assigns.url, lsp.assigns.token) do
+      {:ok, _pid} ->
+        GenLSP.log(lsp, "[LiveDraftLSP] Connected — streaming on word boundaries")
 
-    GenLSP.log(lsp, "[LiveDraftLSP] Connected — streaming on word boundaries")
+      {:error, reason} ->
+        GenLSP.log(lsp, "[LiveDraftLSP] Failed to connect: #{inspect(reason)} — will retry on use")
+    end
+
     {:noreply, lsp}
   end
 
