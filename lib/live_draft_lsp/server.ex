@@ -1,26 +1,33 @@
 defmodule LiveDraftLsp.Server do
   @moduledoc """
-  LSP server that watches for markdown file saves and POSTs content
-  to a Phoenix blog for live preview.
+  LSP server that streams markdown content to a Phoenix blog as you type.
+  Uses a persistent WebSocket channel instead of HTTP per-word.
+  Fires on every word boundary (space, period, newline) and on save.
   """
   use GenLSP
 
   alias GenLSP.Requests.Initialize
   alias GenLSP.Notifications.Initialized
   alias GenLSP.Notifications.TextDocumentDidSave
+  alias GenLSP.Notifications.TextDocumentDidChange
+  alias GenLSP.Notifications.TextDocumentDidOpen
   alias GenLSP.Structures.InitializeResult
   alias GenLSP.Structures.ServerCapabilities
   alias GenLSP.Structures.TextDocumentSyncOptions
   alias GenLSP.Structures.SaveOptions
+  alias GenLSP.Enumerations.TextDocumentSyncKind
 
   require Logger
+
+  @word_boundary_chars [" ", ".", "\n", "\r\n"]
 
   @impl true
   def init(lsp, config) do
     {:ok,
      assign(lsp,
        url: config.url,
-       token: config.token
+       token: config.token,
+       current_slug: nil
      )}
   end
 
@@ -31,10 +38,11 @@ defmodule LiveDraftLsp.Server do
        capabilities: %ServerCapabilities{
          text_document_sync: %TextDocumentSyncOptions{
            open_close: true,
+           change: TextDocumentSyncKind.full(),
            save: %SaveOptions{include_text: true}
          }
        },
-       server_info: %{name: "LiveDraftLSP", version: "0.1.0"}
+       server_info: %{name: "LiveDraftLSP", version: "0.3.0"}
      }, lsp}
   end
 
@@ -45,26 +53,77 @@ defmodule LiveDraftLsp.Server do
 
   @impl true
   def handle_notification(%Initialized{}, lsp) do
-    GenLSP.log(lsp, "[LiveDraftLSP] Initialized — watching for markdown saves")
+    # Connect to Phoenix once the LSP is initialized
+    {:ok, _pid} =
+      LiveDraftLsp.SocketClient.start_link(lsp.assigns.url, lsp.assigns.token)
+
+    GenLSP.log(lsp, "[LiveDraftLSP] Connected — streaming on word boundaries")
     {:noreply, lsp}
   end
 
+  # When a markdown file is opened, join the channel for that slug
+  @impl true
+  def handle_notification(%TextDocumentDidOpen{params: params}, lsp) do
+    uri = params.text_document.uri
+
+    if markdown?(uri) do
+      slug = derive_slug(uri)
+
+      if slug do
+        LiveDraftLsp.SocketClient.join(slug)
+        GenLSP.log(lsp, "[LiveDraftLSP] Joined channel for #{slug}")
+        {:noreply, assign(lsp, current_slug: slug)}
+      else
+        {:noreply, lsp}
+      end
+    else
+      {:noreply, lsp}
+    end
+  end
+
+  # didChange fires on every keystroke with full document content
+  @impl true
+  def handle_notification(%TextDocumentDidChange{params: params}, lsp) do
+    uri = params.text_document.uri
+
+    lsp =
+      if markdown?(uri) do
+        case params.content_changes do
+          [%{text: text} | _] when is_binary(text) ->
+            slug = derive_slug(uri)
+            lsp = maybe_rejoin(slug, lsp)
+
+            if ends_at_word_boundary?(text) do
+              LiveDraftLsp.SocketClient.push_draft(text)
+            end
+
+            lsp
+
+          _ ->
+            lsp
+        end
+      else
+        lsp
+      end
+
+    {:noreply, lsp}
+  end
+
+  # didSave always pushes as a guaranteed sync point
   @impl true
   def handle_notification(%TextDocumentDidSave{params: params}, lsp) do
     uri = params.text_document.uri
     text = params.text
 
-    if markdown?(uri) && text do
-      slug = derive_slug(uri)
-
-      if slug do
-        GenLSP.log(lsp, "[LiveDraftLSP] Posting draft for #{slug}")
-
-        Task.start(fn ->
-          post_draft(lsp.assigns.url, lsp.assigns.token, slug, text)
-        end)
+    lsp =
+      if markdown?(uri) && text do
+        slug = derive_slug(uri)
+        lsp = maybe_rejoin(slug, lsp)
+        LiveDraftLsp.SocketClient.push_draft(text)
+        lsp
+      else
+        lsp
       end
-    end
 
     {:noreply, lsp}
   end
@@ -72,6 +131,22 @@ defmodule LiveDraftLsp.Server do
   @impl true
   def handle_notification(_notification, lsp) do
     {:noreply, lsp}
+  end
+
+  # If the user switched to a different markdown file, join the new channel
+  defp maybe_rejoin(slug, lsp) when slug != nil do
+    if slug != lsp.assigns.current_slug do
+      LiveDraftLsp.SocketClient.join(slug)
+      assign(lsp, current_slug: slug)
+    else
+      lsp
+    end
+  end
+
+  defp maybe_rejoin(_slug, lsp), do: lsp
+
+  defp ends_at_word_boundary?(text) do
+    Enum.any?(@word_boundary_chars, &String.ends_with?(text, &1))
   end
 
   defp markdown?(uri), do: String.ends_with?(uri, ".md")
@@ -87,22 +162,6 @@ defmodule LiveDraftLsp.Server do
     case Regex.run(~r/^\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}-(.+)$/, filename) do
       [_, slug] -> slug
       nil -> filename
-    end
-  end
-
-  defp post_draft(url, token, slug, content) do
-    case Req.post(url,
-           json: %{slug: slug, content: content},
-           headers: [{"x-auth-token", token}]
-         ) do
-      {:ok, %{status: 200}} ->
-        Logger.info("[LiveDraftLSP] Posted draft for #{slug}")
-
-      {:ok, %{status: status, body: body}} ->
-        Logger.error("[LiveDraftLSP] Failed for #{slug}: #{status} — #{inspect(body)}")
-
-      {:error, error} ->
-        Logger.error("[LiveDraftLSP] HTTP error for #{slug}: #{inspect(error)}")
     end
   end
 end

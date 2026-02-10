@@ -22,7 +22,7 @@ defmodule LiveDraftLsp.MixProject do
   defp deps do
     [
       {:gen_lsp, "~> 0.11.0"},
-      {:req, "~> 0.5.0"},
+      {:websockex, "~> 0.4.3"},
       {:jason, "~> 1.2"}
     ]
   end
